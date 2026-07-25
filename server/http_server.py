@@ -25,6 +25,7 @@ Endpoints:
   GET  /api/story/{id}          -> one story (scoped to the user)
   GET  /api/stories?limit=20    -> the user's story library
 """
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -33,7 +34,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from server import gpu, story
+from server import citystory, gpu, story, worker
 from server.identity import resolve_agent_key
 from server.storage.postgres_manager import get_postgres_manager
 
@@ -43,7 +44,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 
 # ---------------------------------------------------------------------------
@@ -64,6 +65,39 @@ class StoryIn(BaseModel):
     dest: Optional[str] = None
     minutes: int = Field(..., ge=1, le=180)
     pois: List[POIIn]
+
+
+# --- Async city-story engine (MikeStoryteller app) ---
+class CityStoryRequest(BaseModel):
+    city: str = Field(..., min_length=1)
+    lat: Optional[float] = None
+    lon: Optional[float] = None
+    theme: str = Field(...)
+    minutes: int = Field(...)
+
+
+class BaselineRequest(BaseModel):
+    home_city: str = Field(..., min_length=1)
+    home_lat: Optional[float] = None
+    home_lon: Optional[float] = None
+    current_city: Optional[str] = None
+    current_lat: Optional[float] = None
+    current_lon: Optional[float] = None
+
+
+def _validate_theme_minutes(theme: str, minutes: int) -> tuple[str, int]:
+    theme = (theme or "").strip().lower()
+    if theme not in citystory.VALID_THEMES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"theme must be one of {list(citystory.VALID_THEMES)}",
+        )
+    if int(minutes) not in citystory.VALID_MINUTES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"minutes must be one of {list(citystory.VALID_MINUTES)}",
+        )
+    return theme, int(minutes)
 
 
 # ---------------------------------------------------------------------------
@@ -100,8 +134,21 @@ async def lifespan(app: FastAPI):
             "OLLAMA_GPU_URL is not set — stories will use the deterministic fallback "
             "template until it is configured."
         )
+    # Start the SINGLE background story-generation worker (serialized generation).
+    stop_event = asyncio.Event()
+    worker_task = asyncio.create_task(worker.run_worker(stop_event))
+    app.state.worker_stop = stop_event
+    app.state.worker_task = worker_task
+    logger.info("Background city-story worker started")
+
     yield
+
     logger.info("Shutting down mikeos-storyteller-cloud...")
+    try:
+        stop_event.set()
+        await asyncio.wait_for(worker_task, timeout=10.0)
+    except Exception as e:
+        logger.error("Worker shutdown error: %s", e)
     try:
         db = await get_postgres_manager()
         await db.close()
@@ -129,6 +176,11 @@ async def root():
             "make_story": "POST /api/story",
             "get_story": "GET /api/story/{id}",
             "list_stories": "GET /api/stories?limit=20",
+            "request_city_story": "POST /api/stories/request",
+            "story_status": "GET /api/stories/status/{job_id}",
+            "city_story": "GET /api/story/{story_id}",
+            "city_library": "GET /api/city-stories?city=&theme=&minutes=",
+            "baseline": "POST /api/stories/baseline",
         },
     }
 
@@ -248,8 +300,29 @@ async def get_story(
     story_id: str,
     user_id: str = Depends(current_user_id),
 ) -> Dict[str, Any]:
-    """One story (scoped to the user)."""
+    """Full story by id.
+
+    First tries the SHARED city_stories cache (the MikeStoryteller contract:
+    a flat {story_id, city, theme, minutes, title, total_words, sources,
+    chapters:[...]} shape). If not a city story, falls back to the user-scoped
+    road-trip story ({"story": row}).
+    """
     db = await get_postgres_manager()
+    city = await db.get_city_story(story_id)
+    if city is not None:
+        return {
+            "story_id": city["id"],
+            "city": city["city"],
+            "theme": city["theme"],
+            "minutes": city["minutes"],
+            "title": city["title"],
+            "total_words": city["total_words"],
+            "sources": city["sources"],
+            "source_book": city["source_book"],
+            "model": city["model"],
+            "created_at": city["created_at"],
+            "chapters": city["chapters"],
+        }
     row = await db.get_story(user_id, story_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Story not found")
@@ -261,7 +334,150 @@ async def list_stories(
     limit: int = Query(default=20, ge=1, le=200),
     user_id: str = Depends(current_user_id),
 ) -> Dict[str, Any]:
-    """The user's story library (lightweight rows), newest first."""
+    """The user's road-trip story library (lightweight rows), newest first."""
     db = await get_postgres_manager()
     stories = await db.list_stories(user_id, limit=limit)
     return {"stories": stories, "count": len(stories)}
+
+
+# ---------------------------------------------------------------------------
+# Async DEEP CITY-STORY engine (MikeStoryteller app contract)
+# ---------------------------------------------------------------------------
+@app.post("/api/stories/request")
+async def request_city_story(
+    body: CityStoryRequest,
+    user_id: str = Depends(current_user_id),
+) -> Dict[str, Any]:
+    """Request a deep city story.
+
+    Cache hit (a READY shared story for city_key/theme/minutes exists) -> return
+    {status:"ready", story_id} immediately, no GPU. Else create/find a queued
+    job and return {status:"queued", job_id}. Generation is async + background.
+    """
+    theme, minutes = _validate_theme_minutes(body.theme, body.minutes)
+    ck = citystory.city_key(body.city)
+    db = await get_postgres_manager()
+
+    ready = await db.find_ready_city_story(ck, theme, minutes)
+    if ready is not None:
+        return {"status": "ready", "story_id": ready["id"]}
+
+    existing = await db.find_open_job(ck, theme, minutes)
+    if existing is not None:
+        return {"status": existing["status"], "job_id": existing["id"]}
+
+    job = await db.create_job(
+        user_id=user_id,
+        city=body.city.strip(),
+        city_key=ck,
+        theme=theme,
+        minutes=minutes,
+        lat=body.lat,
+        lon=body.lon,
+    )
+    if not job or not job.get("id"):
+        raise HTTPException(status_code=500, detail="failed to enqueue story job")
+    return {"status": "queued", "job_id": job["id"]}
+
+
+@app.get("/api/stories/status/{job_id}")
+async def story_status(
+    job_id: str,
+    user_id: str = Depends(current_user_id),
+) -> Dict[str, Any]:
+    """Poll a job: {status, story_id?, error?}."""
+    db = await get_postgres_manager()
+    job = await db.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    out: Dict[str, Any] = {"status": job["status"]}
+    if job.get("story_id"):
+        out["story_id"] = job["story_id"]
+    if job.get("error"):
+        out["error"] = job["error"]
+    return out
+
+
+@app.get("/api/city-stories")
+async def city_story_library(
+    city: Optional[str] = Query(default=None),
+    theme: Optional[str] = Query(default=None),
+    minutes: Optional[int] = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+    user_id: str = Depends(current_user_id),
+) -> Dict[str, Any]:
+    """READY shared city stories matching any subset of filters (library feed)."""
+    ck = citystory.city_key(city) if city else None
+    theme_norm = (theme or "").strip().lower() or None
+    db = await get_postgres_manager()
+    rows = await db.list_city_stories(
+        city_key=ck, theme=theme_norm, minutes=minutes, limit=limit
+    )
+    return {"stories": rows, "count": len(rows)}
+
+
+@app.post("/api/stories/baseline")
+async def baseline(
+    body: BaselineRequest,
+    user_id: str = Depends(current_user_id),
+) -> Dict[str, Any]:
+    """Enqueue ~10 baseline jobs so a new user's library fills over time.
+
+    Home city across several themes at mixed lengths + the current metro.
+    Idempotent: a (city_key,theme,minutes) that is already ready OR has an open
+    job is NOT re-enqueued.
+    """
+    db = await get_postgres_manager()
+
+    # (theme, minutes) plan for the HOME city — a varied, useful starter set.
+    home_plan = [
+        ("complete", 20),
+        ("history", 30),
+        ("people", 20),
+        ("architecture", 10),
+        ("art", 10),
+        ("nature", 10),
+        ("food", 10),
+    ]
+    # A lighter plan for the CURRENT metro (if different from home).
+    current_plan = [
+        ("complete", 10),
+        ("history", 20),
+        ("food", 5),
+    ]
+
+    targets: List[Dict[str, Any]] = []
+    for theme, minutes in home_plan:
+        targets.append({
+            "city": body.home_city, "lat": body.home_lat, "lon": body.home_lon,
+            "theme": theme, "minutes": minutes,
+        })
+    if body.current_city and citystory.city_key(body.current_city) != citystory.city_key(body.home_city):
+        for theme, minutes in current_plan:
+            targets.append({
+                "city": body.current_city, "lat": body.current_lat, "lon": body.current_lon,
+                "theme": theme, "minutes": minutes,
+            })
+
+    jobs: List[Dict[str, Any]] = []
+    for t in targets:
+        ck = citystory.city_key(t["city"])
+        theme, minutes = t["theme"], t["minutes"]
+        ready = await db.find_ready_city_story(ck, theme, minutes)
+        if ready is not None:
+            jobs.append({"status": "ready", "story_id": ready["id"],
+                         "city": t["city"], "theme": theme, "minutes": minutes})
+            continue
+        existing = await db.find_open_job(ck, theme, minutes)
+        if existing is not None:
+            jobs.append({"status": existing["status"], "job_id": existing["id"],
+                         "city": t["city"], "theme": theme, "minutes": minutes})
+            continue
+        job = await db.create_job(
+            user_id=user_id, city=t["city"].strip(), city_key=ck,
+            theme=theme, minutes=minutes, lat=t["lat"], lon=t["lon"],
+        )
+        jobs.append({"status": "queued", "job_id": job["id"],
+                     "city": t["city"], "theme": theme, "minutes": minutes})
+
+    return {"enqueued": sum(1 for j in jobs if j["status"] == "queued"), "jobs": jobs}

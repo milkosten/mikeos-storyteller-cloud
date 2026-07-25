@@ -187,3 +187,49 @@ async def article_text(
     """Plain-text article body for `query`, or None. Best-effort, never raises."""
     art = await article(query, lang=lang, max_chars=max_chars)
     return art["extract"] if art else None
+
+
+async def search(
+    query: str, lang: str = "en", limit: int = 8
+) -> list[Dict[str, str]]:
+    """Return up to `limit` suggested articles for `query` from the local wiki.
+
+    Each item is {"title","path"} (title is a human label). Best-effort — any
+    failure returns []. Used by the city-story engine to discover theme-relevant
+    articles (e.g. notable people, landmarks) beyond the exact city page.
+    """
+    if not is_configured() or not query or not query.strip():
+        return []
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, verify=True) as client:
+            slug = await _resolve_slug(client, _book_name(lang))
+            if not slug:
+                return []
+            r = await client.get(
+                f"{WIKI_URL}/suggest",
+                params={"content": slug, "term": query.strip()},
+                headers=_headers(),
+                timeout=15,
+            )
+            if r.status_code != 200:
+                return []
+            data = r.json()
+            out: list[Dict[str, str]] = []
+            seen = set()
+            for it in data if isinstance(data, list) else []:
+                if it.get("kind") != "path" or not it.get("path"):
+                    continue
+                path = html.unescape(str(it["path"]))
+                if path in seen:
+                    continue
+                seen.add(path)
+                label = html.unescape(str(it.get("label") or path.replace("_", " ")))
+                # Kiwix labels can carry HTML highlighting; strip tags.
+                label = _TAG_RE.sub("", label).strip()
+                out.append({"title": label or path.replace("_", " "), "path": path})
+                if len(out) >= limit:
+                    break
+            return out
+    except Exception as e:  # pragma: no cover - best-effort
+        logger.warning("wiki: search failed for %r: %s", query, e)
+        return []

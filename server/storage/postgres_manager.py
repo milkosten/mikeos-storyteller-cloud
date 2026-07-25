@@ -253,8 +253,335 @@ class PostgreSQLManager:
         ]
 
     # =========================================================================
+    # City stories (SHARED cache) + async job queue.
+    # =========================================================================
+
+    async def find_ready_city_story(
+        self, city_key: str, theme: str, minutes: int
+    ) -> Optional[Dict[str, Any]]:
+        """The cached SHARED story for (city_key, theme, minutes), or None."""
+        pool = await self.get_connection()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                f"""
+                SELECT * FROM {self.schema}.city_stories
+                WHERE city_key = $1 AND theme = $2 AND minutes = $3
+                LIMIT 1
+                """,
+                city_key,
+                theme,
+                int(minutes),
+            )
+        return self._row_to_city_story(row) if row else None
+
+    async def create_city_story(
+        self,
+        *,
+        city: str,
+        city_key: str,
+        theme: str,
+        minutes: int,
+        title: str,
+        chapters: List[Dict[str, Any]],
+        total_words: int,
+        sources: List[str],
+        source_book: Optional[str],
+        model: str,
+    ) -> Dict[str, Any]:
+        """Insert (or return the existing) shared city story. Never-trust-200.
+
+        The unique (city_key, theme, minutes) index makes this idempotent — a
+        concurrent duplicate resolves to the existing row via ON CONFLICT.
+        """
+        pool = await self.get_connection()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                f"""
+                INSERT INTO {self.schema}.city_stories
+                    (city, city_key, theme, minutes, title, chapters,
+                     total_words, sources, source_book, model)
+                VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8::jsonb, $9, $10)
+                ON CONFLICT (city_key, theme, minutes) DO NOTHING
+                RETURNING *
+                """,
+                city,
+                city_key,
+                theme,
+                int(minutes),
+                title,
+                json.dumps(chapters),
+                int(total_words),
+                json.dumps(sources or []),
+                source_book,
+                model,
+            )
+            if row is None:
+                # Lost the race — fetch the existing row.
+                row = await conn.fetchrow(
+                    f"""
+                    SELECT * FROM {self.schema}.city_stories
+                    WHERE city_key = $1 AND theme = $2 AND minutes = $3
+                    LIMIT 1
+                    """,
+                    city_key,
+                    theme,
+                    int(minutes),
+                )
+        return self._row_to_city_story(row)
+
+    async def get_city_story(self, story_id: str) -> Optional[Dict[str, Any]]:
+        """One shared city story by id (NOT user-scoped — cache is shared)."""
+        pool = await self.get_connection()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                f"SELECT * FROM {self.schema}.city_stories WHERE id = $1::uuid",
+                story_id,
+            )
+        return self._row_to_city_story(row) if row else None
+
+    async def list_city_stories(
+        self,
+        *,
+        city_key: Optional[str] = None,
+        theme: Optional[str] = None,
+        minutes: Optional[int] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """READY shared stories matching any subset of filters (library feed)."""
+        clauses = []
+        args: List[Any] = []
+        if city_key:
+            args.append(city_key)
+            clauses.append(f"city_key = ${len(args)}")
+        if theme:
+            args.append(theme)
+            clauses.append(f"theme = ${len(args)}")
+        if minutes is not None:
+            args.append(int(minutes))
+            clauses.append(f"minutes = ${len(args)}")
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        args.append(max(1, min(limit, 500)))
+        pool = await self.get_connection()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                f"""
+                SELECT id, city, theme, minutes, title,
+                       jsonb_array_length(chapters) AS chapter_count,
+                       total_words, created_at
+                FROM {self.schema}.city_stories
+                {where}
+                ORDER BY created_at DESC
+                LIMIT ${len(args)}
+                """,
+                *args,
+            )
+        return [
+            {
+                "story_id": str(r["id"]),
+                "city": r["city"],
+                "theme": r["theme"],
+                "minutes": r["minutes"],
+                "title": r["title"],
+                "chapter_count": r["chapter_count"],
+                "total_words": r["total_words"],
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+            }
+            for r in rows
+        ]
+
+    # --- Job queue ---
+
+    async def find_open_job(
+        self, city_key: str, theme: str, minutes: int
+    ) -> Optional[Dict[str, Any]]:
+        """An existing queued/generating job for this (city_key,theme,minutes)."""
+        pool = await self.get_connection()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                f"""
+                SELECT * FROM {self.schema}.story_jobs
+                WHERE city_key = $1 AND theme = $2 AND minutes = $3
+                  AND status IN ('queued', 'generating')
+                ORDER BY created_at ASC
+                LIMIT 1
+                """,
+                city_key,
+                theme,
+                int(minutes),
+            )
+        return self._row_to_job(row) if row else None
+
+    async def create_job(
+        self,
+        *,
+        user_id: str,
+        city: str,
+        city_key: str,
+        theme: str,
+        minutes: int,
+        lat: Optional[float],
+        lon: Optional[float],
+        status: str = "queued",
+        story_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Enqueue a story job; returns the saved row (never-trust-200)."""
+        pool = await self.get_connection()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                f"""
+                INSERT INTO {self.schema}.story_jobs
+                    (user_id, city, city_key, theme, minutes, lat, lon, status, story_id)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                RETURNING *
+                """,
+                user_id,
+                city,
+                city_key,
+                theme,
+                int(minutes),
+                lat,
+                lon,
+                status,
+                story_id,
+            )
+        return self._row_to_job(row)
+
+    async def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
+        pool = await self.get_connection()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                f"SELECT * FROM {self.schema}.story_jobs WHERE id = $1::uuid",
+                job_id,
+            )
+        return self._row_to_job(row) if row else None
+
+    async def claim_next_job(self) -> Optional[Dict[str, Any]]:
+        """Atomically claim the oldest queued job -> 'generating'. Serialized.
+
+        Uses SELECT ... FOR UPDATE SKIP LOCKED so even with multiple workers only
+        one claims a given job (we run a single worker, so this is belt-and-braces).
+        """
+        pool = await self.get_connection()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    f"""
+                    SELECT * FROM {self.schema}.story_jobs
+                    WHERE status = 'queued'
+                    ORDER BY created_at ASC
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT 1
+                    """
+                )
+                if row is None:
+                    return None
+                row = await conn.fetchrow(
+                    f"""
+                    UPDATE {self.schema}.story_jobs
+                    SET status = 'generating', updated_at = now()
+                    WHERE id = $1
+                    RETURNING *
+                    """,
+                    row["id"],
+                )
+        return self._row_to_job(row)
+
+    async def finish_job(
+        self,
+        job_id: str,
+        *,
+        status: str,
+        story_id: Optional[str] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        """Mark a job ready/failed (also links other open jobs for the same key)."""
+        pool = await self.get_connection()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                f"""
+                UPDATE {self.schema}.story_jobs
+                SET status = $2, story_id = $3::uuid, error = $4, updated_at = now()
+                WHERE id = $1::uuid
+                """,
+                job_id,
+                status,
+                story_id,
+                (error or None) if error else None,
+            )
+
+    async def resolve_ready_jobs_for_story(
+        self, city_key: str, theme: str, minutes: int, story_id: str
+    ) -> None:
+        """Any OTHER queued/generating jobs for this key become ready too (dedupe)."""
+        pool = await self.get_connection()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                f"""
+                UPDATE {self.schema}.story_jobs
+                SET status = 'ready', story_id = $4::uuid, updated_at = now()
+                WHERE city_key = $1 AND theme = $2 AND minutes = $3
+                  AND status IN ('queued', 'generating')
+                """,
+                city_key,
+                theme,
+                int(minutes),
+                story_id,
+            )
+
+    # =========================================================================
     # Row mappers
     # =========================================================================
+
+    @staticmethod
+    def _row_to_city_story(r) -> Optional[Dict[str, Any]]:
+        if r is None:
+            return None
+        chapters = r["chapters"]
+        if isinstance(chapters, str):
+            try:
+                chapters = json.loads(chapters)
+            except Exception:  # noqa: BLE001
+                chapters = []
+        sources = r["sources"] if "sources" in r.keys() else None
+        if isinstance(sources, str):
+            try:
+                sources = json.loads(sources)
+            except Exception:  # noqa: BLE001
+                sources = []
+        return {
+            "id": str(r["id"]),
+            "city": r["city"],
+            "city_key": r["city_key"],
+            "theme": r["theme"],
+            "minutes": r["minutes"],
+            "title": r["title"],
+            "chapters": chapters,
+            "total_words": r["total_words"],
+            "sources": sources or [],
+            "source_book": r["source_book"] if "source_book" in r.keys() else None,
+            "model": r["model"],
+            "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+        }
+
+    @staticmethod
+    def _row_to_job(r) -> Optional[Dict[str, Any]]:
+        if r is None:
+            return None
+        return {
+            "id": str(r["id"]),
+            "user_id": r["user_id"],
+            "city": r["city"],
+            "city_key": r["city_key"],
+            "theme": r["theme"],
+            "minutes": r["minutes"],
+            "lat": r["lat"],
+            "lon": r["lon"],
+            "status": r["status"],
+            "story_id": str(r["story_id"]) if r["story_id"] else None,
+            "error": r["error"],
+            "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+            "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
+        }
 
     @staticmethod
     def _row_to_story(r) -> Optional[Dict[str, Any]]:
