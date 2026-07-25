@@ -27,16 +27,23 @@ back to a deterministic template for that chunk so the endpoint ALWAYS returns
 usable segments (marked model='fallback'). We never return an empty segments
 array with 200.
 """
+import asyncio
 import json
 import logging
 import re
 from typing import Any, Dict, List, Optional
 
 from server import gpu
+from server import wiki as local_wiki  # self-hosted wiki.osmike.com (Kiwix), best-effort
 
 logger = logging.getLogger(__name__)
 
 WORDS_PER_MIN = 150
+# Wiki grounding: enrich notable POIs with a short self-hosted-Wikipedia snippet so
+# the narration is accurate/richer than the OSM blurb alone. Best-effort per POI.
+WIKI_SNIPPET_CHARS = 1100          # per-POI cap fed into the prompt
+WIKI_MAX_POIS = 8                  # cap enriched POIs (protect the prompt + latency)
+WIKI_TOTAL_CHARS = 6000            # global cap on added wiki context across the story
 # POIs per GPU call. Keeps each generation small so a long story stays fast and
 # no single call risks a truncated body.
 CHUNK_SIZE = 4
@@ -114,7 +121,58 @@ def _poi_line(p: Dict[str, Any], budget: int) -> str:
     line = f"- order {order}: \"{name}\" (a {cat}); target ~{budget} words"
     if blurb:
         line += f"; known detail: {blurb}"
+    wiki = (p.get("_wiki") or "").strip()
+    if wiki:
+        # Grounding facts from the self-hosted encyclopedia — use to enrich, not to invent.
+        line += f"\n    background (from Wikipedia, use only what fits): {wiki}"
     return line
+
+
+def _is_notable(p: Dict[str, Any]) -> bool:
+    """A POI worth enriching with a wiki snippet: flagged notable, or a real dwell landmark."""
+    if p.get("notable") is True:
+        return True
+    try:
+        return float(p.get("dwell") or 0.0) >= 2.0
+    except (TypeError, ValueError):
+        return False
+
+
+async def _enrich_pois_with_wiki(pois: List[Dict[str, Any]], lang: str = "en") -> int:
+    """Best-effort: attach a short self-hosted-Wikipedia snippet to notable POIs (in place).
+
+    Grounds the narration in real article text instead of only the OSM blurb. Concurrent,
+    capped by POI count and total added chars; never raises. Returns how many were enriched.
+    """
+    if not local_wiki.is_configured():
+        return 0
+    candidates = [p for p in pois if p.get("name") and _is_notable(p)][:WIKI_MAX_POIS]
+    if not candidates:
+        return 0
+
+    async def _fetch(p: Dict[str, Any]):
+        try:
+            return p, await local_wiki.article_text(
+                str(p["name"]), lang=lang, max_chars=WIKI_SNIPPET_CHARS
+            )
+        except Exception:  # noqa: BLE001 - best-effort
+            return p, None
+
+    results = await asyncio.gather(*[_fetch(p) for p in candidates])
+    used = 0
+    budget = WIKI_TOTAL_CHARS
+    for p, text in results:
+        if not text or budget <= 0:
+            continue
+        snippet = text[:min(WIKI_SNIPPET_CHARS, budget)].strip()
+        if len(snippet) < 60:
+            continue
+        p["_wiki"] = snippet
+        budget -= len(snippet)
+        used += 1
+    if used:
+        logger.info("wiki: enriched %d/%d notable POIs from wiki.osmike.com", used, len(candidates))
+    return used
 
 
 async def _generate_chunk(
@@ -333,6 +391,12 @@ async def generate_story(
         key=lambda t: (t[1].get("order") if t[1].get("order") is not None else t[0]),
     )
     pois = [p for _, p in ordered]
+
+    # Ground notable POIs in real self-hosted-Wikipedia text (best-effort; degrades to blurbs).
+    try:
+        await _enrich_pois_with_wiki(pois)
+    except Exception as e:  # noqa: BLE001 - never let enrichment break story generation
+        logger.warning("wiki enrichment skipped: %s", e)
 
     total_words = int(minutes) * WORDS_PER_MIN
     budgets = word_budget(pois, total_words)
