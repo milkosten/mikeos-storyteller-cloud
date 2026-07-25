@@ -44,7 +44,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
+
+# Strong references to fire-and-forget background tasks (road-trip audio prewarm).
+# Without this, asyncio may GC a task mid-flight (it only keeps a weak ref), silently
+# cancelling the prewarm. We discard each task from the set when it finishes.
+_bg_tasks: set = set()
+
+
+def _spawn_bg(coro) -> None:
+    task = asyncio.ensure_future(coro)
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
 
 
 # ---------------------------------------------------------------------------
@@ -77,12 +88,53 @@ class CityStoryRequest(BaseModel):
 
 
 class BaselineRequest(BaseModel):
-    home_city: str = Field(..., min_length=1)
+    """Kick a ~10-story baseline for a city.
+
+    The MikeStoryteller app sends the CURRENT city it wants a library for as
+    `city` (its whole model is "keep ~10 ready for the city Mike is in now").
+    `home_city` / `current_city` are accepted for back-compat and to let the app
+    ALSO seed a lighter set for a second city in one call. At least one of
+    `city` / `home_city` / `current_city` must be present (validated in the
+    handler so a missing field is a clean 422 with a useful message)."""
+    city: Optional[str] = None
+    lat: Optional[float] = None
+    lon: Optional[float] = None
+    home_city: Optional[str] = None
     home_lat: Optional[float] = None
     home_lon: Optional[float] = None
     current_city: Optional[str] = None
     current_lat: Optional[float] = None
     current_lon: Optional[float] = None
+
+
+async def _segments_with_audio(
+    db, story_id: str, segments: List[Dict[str, Any]], lang: str
+) -> List[Dict[str, Any]]:
+    """Attach a relative `audio_url` (+ best-effort `audio_ready`) to each road-trip
+    segment so the app downloads narration exactly like a city-story chapter.
+
+    A segment is ALWAYS fetchable via its audio_url (the proxy synthesizes on
+    demand); `audio_ready` just reports whether the tts cache is already warm.
+    """
+    audio_map: Dict[int, Dict[str, Any]] = {}
+    if tts.is_configured():
+        try:
+            audio_map = await db.get_segment_audio_map(story_id, lang)
+        except Exception:  # noqa: BLE001 - reporting only, never fail the response
+            audio_map = {}
+    out: List[Dict[str, Any]] = []
+    for seg in (segments or []):
+        order = seg.get("order")
+        a = audio_map.get(order) if order is not None else None
+        enriched = dict(seg)
+        enriched["audio_url"] = (
+            f"/api/story/{story_id}/segment/{order}/audio" if order is not None else None
+        )
+        enriched["audio_ready"] = bool(a and a.get("status") == "ready")
+        if a and a.get("duration_sec"):
+            enriched["audio_duration_sec"] = a["duration_sec"]
+        out.append(enriched)
+    return out
 
 
 def _validate_theme_minutes(theme: str, minutes: int) -> tuple[str, int]:
@@ -180,6 +232,7 @@ async def root():
             "story_status": "GET /api/stories/status/{job_id}",
             "city_story": "GET /api/story/{story_id}",
             "chapter_audio": "GET /api/story/{story_id}/chapter/{index}/audio",
+            "segment_audio": "GET /api/story/{story_id}/segment/{order}/audio",
             "city_library": "GET /api/city-stories?city=&theme=&minutes=",
             "baseline": "POST /api/stories/baseline",
         },
@@ -242,7 +295,10 @@ async def make_story(
                 "poi_count": cached["poi_count"],
                 "total_words": cached["total_words"],
                 "model": cached["model"],
-                "segments": cached["segments"],
+                "audio_available": tts.is_configured(),
+                "segments": await _segments_with_audio(
+                    db, cached["id"], cached["segments"], "en"
+                ),
                 "cached": True,
             }
 
@@ -283,6 +339,11 @@ async def make_story(
         result["total_words"],
         result["model"],
     )
+    # Pre-warm the tts.osmike.com cache for each segment in the BACKGROUND so the
+    # app's first audio fetch is instant. A bonus AFTER the story is saved — a tts
+    # hiccup never delays or fails this response (the proxy still synths on demand).
+    if tts.is_configured():
+        _spawn_bg(worker.prewarm_roadtrip_audio(saved["id"], user_id))
     return {
         "story_id": saved["id"],
         "trip_id": saved["trip_id"],
@@ -291,7 +352,8 @@ async def make_story(
         "poi_count": saved["poi_count"],
         "total_words": saved["total_words"],
         "model": saved["model"],
-        "segments": saved["segments"],
+        "audio_available": tts.is_configured(),
+        "segments": await _segments_with_audio(db, saved["id"], saved["segments"], "en"),
         "cached": False,
     }
 
@@ -418,6 +480,73 @@ async def get_chapter_audio(
     )
 
 
+@app.get("/api/story/{story_id}/segment/{order}/audio")
+async def get_segment_audio(
+    story_id: str,
+    order: int,
+    user_id: str = Depends(current_user_id),
+):
+    """Stream a road-trip SEGMENT's spoken MP3 (the app's road-trip audio contract).
+
+    The road-trip analogue of the chapter-audio proxy. Road-trip stories are
+    user-scoped (`stories` table), so this is looked up per user_id, its segment
+    matched by `order`, its text POSTed to tts.osmike.com with the SERVER-SIDE
+    TTS_TOKEN (cache hit -> fast), and returned as audio/mpeg. The app NEVER holds
+    the TTS token. On a tts failure returns a clean 502/503 — never a fake 200.
+    """
+    if not tts.is_configured():
+        raise HTTPException(status_code=503, detail="audio (TTS) is not configured on this server")
+
+    db = await get_postgres_manager()
+    story = await db.get_story(user_id, story_id)
+    if story is None:
+        raise HTTPException(status_code=404, detail="Story not found")
+
+    segments = story.get("segments") or []
+    seg = next((s for s in segments if s.get("order") == order), None)
+    if seg is None and 0 <= order < len(segments):
+        seg = segments[order]  # tolerate segments whose order is positional
+    if seg is None:
+        raise HTTPException(status_code=404, detail="Segment not found")
+
+    text = (seg.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=404, detail="Segment has no text")
+
+    lang = tts.normalize_lang(story.get("lang"))
+    try:
+        data, cache_hit = await tts.synthesize(text, lang)
+    except tts.TTSError as e:
+        logger.warning("segment audio %s/%d tts failed: %s", story_id, order, e)
+        try:
+            await db.upsert_segment_audio(
+                story_id=story_id, segment_order=order, lang=lang,
+                status="failed", error=str(e)[:500],
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        raise HTTPException(status_code=502, detail="text-to-speech synthesis failed")
+
+    try:
+        await db.upsert_segment_audio(
+            story_id=story_id, segment_order=order, lang=lang, status="ready",
+            byte_len=len(data), duration_sec=tts.estimate_duration_sec(len(data)),
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+    return Response(
+        content=data,
+        media_type="audio/mpeg",
+        headers={
+            "Content-Length": str(len(data)),
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "public, max-age=86400",
+            "X-TTS-Cache": "hit" if cache_hit else "miss",
+        },
+    )
+
+
 @app.get("/api/stories")
 async def list_stories(
     limit: int = Query(default=20, ge=1, le=200),
@@ -510,41 +639,69 @@ async def baseline(
     body: BaselineRequest,
     user_id: str = Depends(current_user_id),
 ) -> Dict[str, Any]:
-    """Enqueue ~10 baseline jobs so a new user's library fills over time.
+    """Enqueue a ~10-story baseline so a city's library fills over time.
 
-    Home city across several themes at mixed lengths + the current metro.
-    Idempotent: a (city_key,theme,minutes) that is already ready OR has an open
-    job is NOT re-enqueued.
+    The PRIMARY city (the app's `city`, i.e. the city Mike is in now — falling
+    back to `home_city`/`current_city`) gets the full varied ~10-job plan. If a
+    DISTINCT second city is also supplied, it gets a lighter starter plan in the
+    same call. Idempotent: a (city_key,theme,minutes) that is already ready OR
+    has an open job is NOT re-enqueued, so re-running creates 0 duplicates.
     """
+    # The primary city to baseline: `city` (the app's contract) first, then the
+    # legacy home/current fields. A request with none of them is a clean 422.
+    primary_city = (body.city or body.home_city or body.current_city or "").strip()
+    if not primary_city:
+        raise HTTPException(
+            status_code=422,
+            detail="baseline needs a city (send {\"city\": \"<name>\"})",
+        )
+    primary_lat = body.lat if body.city else (body.home_lat if body.home_city else body.current_lat)
+    primary_lon = body.lon if body.city else (body.home_lon if body.home_city else body.current_lon)
+
     db = await get_postgres_manager()
 
-    # (theme, minutes) plan for the HOME city — a varied, useful starter set.
-    home_plan = [
+    # Full varied ~10-job plan for the PRIMARY city (matches the app's target of
+    # ~10 ready stories per city: themes across mixed lengths).
+    primary_plan = [
         ("complete", 20),
         ("history", 30),
+        ("history", 10),
         ("people", 20),
+        ("people", 10),
         ("architecture", 10),
         ("art", 10),
         ("nature", 10),
         ("food", 10),
+        ("food", 5),
     ]
-    # A lighter plan for the CURRENT metro (if different from home).
-    current_plan = [
+    # A lighter starter plan for a DISTINCT second city, if the app named one.
+    secondary_plan = [
         ("complete", 10),
         ("history", 20),
         ("food", 5),
     ]
 
     targets: List[Dict[str, Any]] = []
-    for theme, minutes in home_plan:
+    for theme, minutes in primary_plan:
         targets.append({
-            "city": body.home_city, "lat": body.home_lat, "lon": body.home_lon,
+            "city": primary_city, "lat": primary_lat, "lon": primary_lon,
             "theme": theme, "minutes": minutes,
         })
-    if body.current_city and citystory.city_key(body.current_city) != citystory.city_key(body.home_city):
-        for theme, minutes in current_plan:
+    # A second, DISTINCT city: prefer current_city, else home_city, whichever
+    # differs from the primary. (Lets one baseline call warm home + current.)
+    second_city = None
+    second_lat = second_lon = None
+    for cand, clat, clon in (
+        (body.current_city, body.current_lat, body.current_lon),
+        (body.home_city, body.home_lat, body.home_lon),
+    ):
+        if cand and citystory.city_key(cand) != citystory.city_key(primary_city):
+            second_city, second_lat, second_lon = cand, clat, clon
+            break
+    if second_city:
+        for theme, minutes in secondary_plan:
             targets.append({
-                "city": body.current_city, "lat": body.current_lat, "lon": body.current_lon,
+                "city": second_city, "lat": second_lat, "lon": second_lon,
                 "theme": theme, "minutes": minutes,
             })
 

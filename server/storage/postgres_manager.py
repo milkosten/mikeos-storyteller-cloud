@@ -595,6 +595,70 @@ class PostgreSQLManager:
         }
 
     # =========================================================================
+    # Segment audio (road-trip story TTS synth state — parallels chapter_audio)
+    # =========================================================================
+
+    async def upsert_segment_audio(
+        self,
+        *,
+        story_id: str,
+        segment_order: int,
+        lang: str,
+        status: str,
+        byte_len: Optional[int] = None,
+        duration_sec: Optional[int] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        """Record (or update) the TTS synth state of one road-trip segment. Idempotent."""
+        pool = await self.get_connection()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                f"""
+                INSERT INTO {self.schema}.segment_audio
+                    (story_id, segment_order, lang, byte_len, duration_sec,
+                     status, error, updated_at)
+                VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, now())
+                ON CONFLICT (story_id, segment_order, lang) DO UPDATE
+                SET byte_len = EXCLUDED.byte_len,
+                    duration_sec = EXCLUDED.duration_sec,
+                    status = EXCLUDED.status,
+                    error = EXCLUDED.error,
+                    updated_at = now()
+                """,
+                story_id,
+                int(segment_order),
+                (lang or "en"),
+                byte_len,
+                duration_sec,
+                status,
+                (error or None) if error else None,
+            )
+
+    async def get_segment_audio_map(
+        self, story_id: str, lang: str
+    ) -> Dict[int, Dict[str, Any]]:
+        """Map segment_order -> {status, byte_len, duration_sec} for a story/lang."""
+        pool = await self.get_connection()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                f"""
+                SELECT segment_order, status, byte_len, duration_sec
+                FROM {self.schema}.segment_audio
+                WHERE story_id = $1::uuid AND lang = $2
+                """,
+                story_id,
+                (lang or "en"),
+            )
+        return {
+            int(r["segment_order"]): {
+                "status": r["status"],
+                "byte_len": r["byte_len"],
+                "duration_sec": r["duration_sec"],
+            }
+            for r in rows
+        }
+
+    # =========================================================================
     # Row mappers
     # =========================================================================
 

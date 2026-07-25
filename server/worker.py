@@ -76,6 +76,58 @@ async def _prewarm_audio(story_id: str) -> None:
     logger.info("audio prewarm %s done: %d/%d chapters ready", story_id, ok, len(chapters))
 
 
+async def prewarm_roadtrip_audio(story_id: str, user_id: str) -> None:
+    """PRE-WARM the tts.osmike.com cache for every segment of a road-trip story.
+
+    The road-trip analogue of [_prewarm_audio]: a bonus pass run in the
+    background AFTER `POST /api/story` has already returned, so a tts hiccup
+    never delays (or fails) the story. Road-trip stories live in the per-user
+    `stories` table (segments, not chapters), so it reads via get_story and
+    records per-segment synth state in `segment_audio`. Serialized per segment
+    (respect the box). Never raises.
+    """
+    if not tts.is_configured():
+        logger.info("roadtrip audio prewarm skipped for %s: TTS_TOKEN not configured", story_id)
+        return
+    db = await get_postgres_manager()
+    story = await db.get_story(user_id, story_id)
+    if story is None:
+        return
+    lang = tts.normalize_lang(story.get("lang"))
+    segments = story.get("segments") or []
+    ok = 0
+    for seg in segments:
+        order = seg.get("order")
+        text = (seg.get("text") or "").strip()
+        if order is None or not text:
+            continue
+        try:
+            data, cache_hit = await tts.synthesize(text, lang)
+            await db.upsert_segment_audio(
+                story_id=story_id,
+                segment_order=int(order),
+                lang=lang,
+                status="ready",
+                byte_len=len(data),
+                duration_sec=tts.estimate_duration_sec(len(data)),
+            )
+            ok += 1
+            logger.info(
+                "roadtrip audio prewarm %s seg%s: %d bytes (cache=%s)",
+                story_id, order, len(data), "hit" if cache_hit else "miss",
+            )
+        except Exception as e:  # noqa: BLE001 - audio is a bonus, never fatal
+            logger.warning("roadtrip audio prewarm %s seg%s FAILED: %s", story_id, order, e)
+            try:
+                await db.upsert_segment_audio(
+                    story_id=story_id, segment_order=int(order), lang=lang,
+                    status="failed", error=str(e)[:500],
+                )
+            except Exception:  # noqa: BLE001
+                pass
+    logger.info("roadtrip audio prewarm %s done: %d/%d segments ready", story_id, ok, len(segments))
+
+
 async def _process_one() -> bool:
     """Claim + process one queued job. Returns True if a job was handled."""
     db = await get_postgres_manager()

@@ -432,6 +432,13 @@ async def generate_story(
     segments.sort(
         key=lambda s: (s.get("order") if s.get("order") is not None else 0)
     )
+    # Renumber to a DENSE, unique 0..n-1 order (preserving drive-past sequence). POI
+    # `order` comes straight from MikeGuide and is neither validated nor guaranteed
+    # contiguous/unique; duplicates would otherwise collide the app's Room
+    # (story_id, chapter_index) PK (silently dropping a chapter on REPLACE) and make
+    # two segments share one audio_url. This makes order canonical for both.
+    for i, s in enumerate(segments):
+        s["order"] = i
     computed_words = sum(len((s.get("text") or "").split()) for s in segments)
     return {
         "segments": segments,
