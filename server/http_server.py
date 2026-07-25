@@ -31,10 +31,10 @@ import os
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response
 from pydantic import BaseModel, Field
 
-from server import citystory, gpu, story, worker
+from server import citystory, gpu, story, tts, worker
 from server.identity import resolve_agent_key
 from server.storage.postgres_manager import get_postgres_manager
 
@@ -44,7 +44,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +179,7 @@ async def root():
             "request_city_story": "POST /api/stories/request",
             "story_status": "GET /api/stories/status/{job_id}",
             "city_story": "GET /api/story/{story_id}",
+            "chapter_audio": "GET /api/story/{story_id}/chapter/{index}/audio",
             "city_library": "GET /api/city-stories?city=&theme=&minutes=",
             "baseline": "POST /api/stories/baseline",
         },
@@ -310,6 +311,23 @@ async def get_story(
     db = await get_postgres_manager()
     city = await db.get_city_story(story_id)
     if city is not None:
+        lang = tts.normalize_lang(city.get("lang"))
+        # Per-chapter audio state (pre-warmed by the worker). A chapter is
+        # ALWAYS fetchable via its audio_url (the proxy synths on demand); the
+        # audio_ready flag just tells the app the tts cache is already warm.
+        audio_map = await db.get_chapter_audio_map(city["id"], lang)
+        chapters = []
+        for ch in (city["chapters"] or []):
+            idx = ch.get("index")
+            a = audio_map.get(idx) if idx is not None else None
+            enriched = dict(ch)
+            enriched["audio_url"] = (
+                f"/api/story/{city['id']}/chapter/{idx}/audio" if idx is not None else None
+            )
+            enriched["audio_ready"] = bool(a and a.get("status") == "ready")
+            if a and a.get("duration_sec"):
+                enriched["audio_duration_sec"] = a["duration_sec"]
+            chapters.append(enriched)
         return {
             "story_id": city["id"],
             "city": city["city"],
@@ -320,13 +338,84 @@ async def get_story(
             "sources": city["sources"],
             "source_book": city["source_book"],
             "model": city["model"],
+            "lang": lang,
+            "audio_available": tts.is_configured(),
             "created_at": city["created_at"],
-            "chapters": city["chapters"],
+            "chapters": chapters,
         }
     row = await db.get_story(user_id, story_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Story not found")
     return {"story": row}
+
+
+@app.get("/api/story/{story_id}/chapter/{index}/audio")
+async def get_chapter_audio(
+    story_id: str,
+    index: int,
+    user_id: str = Depends(current_user_id),
+):
+    """Stream a chapter's spoken MP3 (the MikeStoryteller app audio contract).
+
+    Auth via X-API-KEY (same resolve as every other endpoint — the app NEVER
+    holds the TTS token). Looks up the chapter text, POSTs it to tts.osmike.com
+    with the SERVER-SIDE TTS_TOKEN (cache hit -> fast), and returns the MP3 with
+    `Content-Type: audio/mpeg`. On a tts failure returns a clean 502/503 — never
+    a fake 200 with an empty body.
+    """
+    if not tts.is_configured():
+        raise HTTPException(status_code=503, detail="audio (TTS) is not configured on this server")
+
+    db = await get_postgres_manager()
+    city = await db.get_city_story(story_id)
+    if city is None:
+        raise HTTPException(status_code=404, detail="Story not found")
+
+    chapters = city.get("chapters") or []
+    ch = next((c for c in chapters if c.get("index") == index), None)
+    if ch is None and 0 <= index < len(chapters):
+        ch = chapters[index]  # tolerate stories whose chapters lack an index
+    if ch is None:
+        raise HTTPException(status_code=404, detail="Chapter not found")
+
+    text = (ch.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=404, detail="Chapter has no text")
+
+    lang = tts.normalize_lang(city.get("lang"))
+    try:
+        data, cache_hit = await tts.synthesize(text, lang)
+    except tts.TTSError as e:
+        logger.warning("chapter audio %s/%d tts failed: %s", story_id, index, e)
+        # Record the failure state (best-effort) and return a clean 502.
+        try:
+            await db.upsert_chapter_audio(
+                story_id=story_id, chapter_index=index, lang=lang,
+                status="failed", error=str(e)[:500],
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        raise HTTPException(status_code=502, detail="text-to-speech synthesis failed")
+
+    # Record ready state so status/get-story can report audio_ready (best-effort).
+    try:
+        await db.upsert_chapter_audio(
+            story_id=story_id, chapter_index=index, lang=lang, status="ready",
+            byte_len=len(data), duration_sec=tts.estimate_duration_sec(len(data)),
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+    return Response(
+        content=data,
+        media_type="audio/mpeg",
+        headers={
+            "Content-Length": str(len(data)),
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "public, max-age=86400",
+            "X-TTS-Cache": "hit" if cache_hit else "miss",
+        },
+    )
 
 
 @app.get("/api/stories")

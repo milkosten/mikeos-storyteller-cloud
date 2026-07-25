@@ -287,6 +287,7 @@ class PostgreSQLManager:
         sources: List[str],
         source_book: Optional[str],
         model: str,
+        lang: str = "en",
     ) -> Dict[str, Any]:
         """Insert (or return the existing) shared city story. Never-trust-200.
 
@@ -299,8 +300,8 @@ class PostgreSQLManager:
                 f"""
                 INSERT INTO {self.schema}.city_stories
                     (city, city_key, theme, minutes, title, chapters,
-                     total_words, sources, source_book, model)
-                VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8::jsonb, $9, $10)
+                     total_words, sources, source_book, model, lang)
+                VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8::jsonb, $9, $10, $11)
                 ON CONFLICT (city_key, theme, minutes) DO NOTHING
                 RETURNING *
                 """,
@@ -314,6 +315,7 @@ class PostgreSQLManager:
                 json.dumps(sources or []),
                 source_book,
                 model,
+                (lang or "en"),
             )
             if row is None:
                 # Lost the race — fetch the existing row.
@@ -529,6 +531,70 @@ class PostgreSQLManager:
             )
 
     # =========================================================================
+    # Chapter audio (per-chapter TTS synth state; MP3 bytes live in tts cache)
+    # =========================================================================
+
+    async def upsert_chapter_audio(
+        self,
+        *,
+        story_id: str,
+        chapter_index: int,
+        lang: str,
+        status: str,
+        byte_len: Optional[int] = None,
+        duration_sec: Optional[int] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        """Record (or update) the TTS synth state of one chapter. Idempotent."""
+        pool = await self.get_connection()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                f"""
+                INSERT INTO {self.schema}.chapter_audio
+                    (story_id, chapter_index, lang, byte_len, duration_sec,
+                     status, error, updated_at)
+                VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, now())
+                ON CONFLICT (story_id, chapter_index, lang) DO UPDATE
+                SET byte_len = EXCLUDED.byte_len,
+                    duration_sec = EXCLUDED.duration_sec,
+                    status = EXCLUDED.status,
+                    error = EXCLUDED.error,
+                    updated_at = now()
+                """,
+                story_id,
+                int(chapter_index),
+                (lang or "en"),
+                byte_len,
+                duration_sec,
+                status,
+                (error or None) if error else None,
+            )
+
+    async def get_chapter_audio_map(
+        self, story_id: str, lang: str
+    ) -> Dict[int, Dict[str, Any]]:
+        """Map chapter_index -> {status, byte_len, duration_sec} for a story/lang."""
+        pool = await self.get_connection()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                f"""
+                SELECT chapter_index, status, byte_len, duration_sec
+                FROM {self.schema}.chapter_audio
+                WHERE story_id = $1::uuid AND lang = $2
+                """,
+                story_id,
+                (lang or "en"),
+            )
+        return {
+            int(r["chapter_index"]): {
+                "status": r["status"],
+                "byte_len": r["byte_len"],
+                "duration_sec": r["duration_sec"],
+            }
+            for r in rows
+        }
+
+    # =========================================================================
     # Row mappers
     # =========================================================================
 
@@ -560,6 +626,7 @@ class PostgreSQLManager:
             "sources": sources or [],
             "source_book": r["source_book"] if "source_book" in r.keys() else None,
             "model": r["model"],
+            "lang": (r["lang"] if "lang" in r.keys() else None) or "en",
             "created_at": r["created_at"].isoformat() if r["created_at"] else None,
         }
 

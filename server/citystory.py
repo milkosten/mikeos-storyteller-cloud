@@ -562,4 +562,7 @@ async def generate_city_story(
         "sources": source_urls,
         "source_book": book_slug,
         "model": model,
+        # Narration language for the TTS layer. Sources are English wiki -> 'en'.
+        # (Threaded through so a future multi-lingual engine can override it.)
+        "lang": "en",
     }

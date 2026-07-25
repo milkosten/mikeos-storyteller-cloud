@@ -18,12 +18,62 @@ success, resolves ALL other open jobs for the same key to the same story
 import asyncio
 import logging
 
-from server import citystory
+from server import citystory, tts
 from server.storage.postgres_manager import get_postgres_manager
 
 logger = logging.getLogger(__name__)
 
 POLL_INTERVAL_SEC = 5.0
+
+
+async def _prewarm_audio(story_id: str) -> None:
+    """PRE-WARM the tts.osmike.com cache for every chapter of a ready story.
+
+    A BONUS pass, run AFTER the story is already marked ready — a tts hiccup must
+    NEVER fail (or block) the story. Serialized per-chapter (respect the box).
+    Records per-chapter synth state in chapter_audio so status can report it.
+    Never-trust-200 is enforced inside tts.synthesize (audio/mpeg + real bytes).
+    """
+    if not tts.is_configured():
+        logger.info("audio prewarm skipped for %s: TTS_TOKEN not configured", story_id)
+        return
+    db = await get_postgres_manager()
+    story = await db.get_city_story(story_id)
+    if story is None:
+        return
+    lang = tts.normalize_lang(story.get("lang"))
+    chapters = story.get("chapters") or []
+    ok = 0
+    for ch in chapters:
+        idx = ch.get("index")
+        text = (ch.get("text") or "").strip()
+        if idx is None or not text:
+            continue
+        try:
+            data, cache_hit = await tts.synthesize(text, lang)
+            await db.upsert_chapter_audio(
+                story_id=story_id,
+                chapter_index=int(idx),
+                lang=lang,
+                status="ready",
+                byte_len=len(data),
+                duration_sec=tts.estimate_duration_sec(len(data)),
+            )
+            ok += 1
+            logger.info(
+                "audio prewarm %s ch%s: %d bytes (cache=%s)",
+                story_id, idx, len(data), "hit" if cache_hit else "miss",
+            )
+        except Exception as e:  # noqa: BLE001 - audio is a bonus, never fatal
+            logger.warning("audio prewarm %s ch%s FAILED: %s", story_id, idx, e)
+            try:
+                await db.upsert_chapter_audio(
+                    story_id=story_id, chapter_index=int(idx), lang=lang,
+                    status="failed", error=str(e)[:500],
+                )
+            except Exception:  # noqa: BLE001
+                pass
+    logger.info("audio prewarm %s done: %d/%d chapters ready", story_id, ok, len(chapters))
 
 
 async def _process_one() -> bool:
@@ -47,6 +97,8 @@ async def _process_one() -> bool:
             logger.info("worker: cache filled while queued -> job %s ready (%s)", job_id, cached["id"])
             await db.finish_job(job_id, status="ready", story_id=cached["id"])
             await db.resolve_ready_jobs_for_story(ck, theme, minutes, cached["id"])
+            # Pre-warm audio (bonus, after ready). A tts hiccup must not fail here.
+            await _prewarm_audio(cached["id"])
             return True
 
         result = await citystory.generate_city_story(city, theme, minutes)
@@ -62,6 +114,7 @@ async def _process_one() -> bool:
             sources=result["sources"],
             source_book=result["source_book"],
             model=result["model"],
+            lang=result.get("lang", "en"),
         )
         if not saved or not saved.get("id"):
             raise RuntimeError("failed to persist city story")
@@ -74,6 +127,9 @@ async def _process_one() -> bool:
             job_id, saved["id"], len(result["chapters"]),
             result["total_words"], result["model"],
         )
+        # Pre-warm the TTS cache for each chapter now the story is ready. This is
+        # a BONUS layer AFTER ready — a tts failure never fails the story.
+        await _prewarm_audio(saved["id"])
         return True
     except Exception as e:  # noqa: BLE001
         logger.exception("worker: job %s FAILED: %s", job_id, e)
