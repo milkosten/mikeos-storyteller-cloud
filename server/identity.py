@@ -15,13 +15,44 @@ import logging
 from typing import Optional
 
 import httpx
+import jwt
+from jwt import PyJWKClient
 
 logger = logging.getLogger(__name__)
 
 MIKEOSCOMPUTERS_URL = os.environ.get(
     "MIKEOSCOMPUTERS_URL",
-    "https://mikeoscomputers-production.up.railway.app",
+    "https://account.osmike.com",
 )
+
+ISSUER = os.environ.get("ACCOUNT_OSMIKE_ISSUER", "https://account.osmike.com")
+JWKS_URL = os.environ.get("ACCOUNT_OSMIKE_JWKS_URL", f"{ISSUER}/oauth/jwks.json")
+# Tolerant aud: device tokens carry aud="storyteller", web tokens aud="account.osmike.com".
+_AUDIENCES = [a.strip() for a in os.environ.get(
+    "OAUTH_AUDIENCE", "storyteller,account.osmike.com").split(",") if a.strip()]
+_jwks_client = PyJWKClient(JWKS_URL, cache_keys=True, lifespan=3600)
+
+
+def _verify_bearer(token: str):
+    """Validate an account.osmike.com RS256 JWT locally via JWKS. None if invalid."""
+    try:
+        key = _jwks_client.get_signing_key_from_jwt(token).key
+        return jwt.decode(
+            token, key, algorithms=["RS256"], issuer=ISSUER, audience=_AUDIENCES,
+            options={"require": ["exp", "iss", "sub"]},
+        )
+    except Exception as e:
+        logger.warning("Bearer rejected: %s", e)
+        return None
+
+
+async def authenticate(authorization: Optional[str], x_api_key: Optional[str]) -> Optional[str]:
+    """Return user_id or None. OAuth Bearer first, then legacy X-API-KEY."""
+    if authorization and authorization.lower().startswith("bearer "):
+        claims = _verify_bearer(authorization[7:].strip())
+        # A present-but-invalid Bearer MUST 401 (do NOT silently fall through).
+        return str(claims["sub"]) if claims else None
+    return await resolve_agent_key(x_api_key)
 
 _RESOLVE_CACHE_TTL = 300  # seconds
 _resolve_cache: dict[str, tuple[str, float]] = {}  # agent_key -> (user_id, expires)

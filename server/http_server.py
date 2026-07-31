@@ -35,7 +35,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response
 from pydantic import BaseModel, Field
 
 from server import citystory, gpu, story, tts, worker
-from server.identity import resolve_agent_key
+from server.identity import authenticate, resolve_agent_key
 from server.storage.postgres_manager import get_postgres_manager
 
 logging.basicConfig(
@@ -156,12 +156,13 @@ def _validate_theme_minutes(theme: str, minutes: int) -> tuple[str, int]:
 # Auth dependency: resolve X-API-KEY -> user_id
 # ---------------------------------------------------------------------------
 async def current_user_id(
+    authorization: Optional[str] = Header(default=None),
     x_api_key: Optional[str] = Header(default=None, alias="X-API-KEY"),
 ) -> str:
-    """Resolve the caller's hive agent key to a user_id, or 401."""
-    user_id = await resolve_agent_key(x_api_key)
+    """Resolve the caller (Bearer JWT first, then legacy X-API-KEY) to a user_id, or 401."""
+    user_id = await authenticate(authorization, x_api_key)
     if not user_id:
-        raise HTTPException(status_code=401, detail="Invalid or missing X-API-KEY")
+        raise HTTPException(status_code=401, detail="Invalid or missing credentials")
     return user_id
 
 

@@ -10,3 +10,6 @@ pydantic>=2.5.0
 
 # Identity resolution against mikeoscomputers (agent-key -> user_id)
 httpx>=0.26.0
+
+# Bearer JWT (account.osmike.com RS256 / JWKS) verification
+PyJWT[crypto]>=2.8.0
